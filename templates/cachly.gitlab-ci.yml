@@ -1,8 +1,10 @@
 # Cachly Brain — GitLab CI/CD template
 #
 # The GitLab equivalent of the `cachly-dev/cachly-action` GitHub Action.
-# Same modes (setup, learn, scan, confirm, hygiene), same Brain API, same
-# self-calibrating closed loop — reported to the Brain as source "gitlab_ci".
+# Covers the learn, scan, confirm and hygiene modes (setup and predict are
+# GitHub-Action-only for now) — same Brain API, same self-calibrating closed
+# loop, reported to the Brain as source "gitlab_ci". This is an includable
+# template (include: remote:), not a GitLab CI/CD Catalog component.
 #
 # Usage — add this to your project's .gitlab-ci.yml:
 #
@@ -116,20 +118,44 @@ variables:
           print("ℹ️  Pipeline cancelled — not reporting to Brain.")
           raise SystemExit(0)
 
-      payload = json.dumps({
+      def post(path, payload):
+          req = urllib.request.Request(
+              f"{api}/api/v1/instances/{inst}/{path}",
+              data=json.dumps(payload).encode(),
+              headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+              method="POST",
+          )
+          return urllib.request.urlopen(req, timeout=15)
+
+      # A red pipeline becomes a Brain lesson (parity with the GitHub Action's
+      # confirm mode) so the next MR scan can warn "your Brain would have caught
+      # this". Best-effort — never fails the pipeline.
+      if status == "failure":
+          run_url = os.environ.get("CI_PIPELINE_URL", "")
+          fail_topic = topics[0]
+          lesson = {
+              "topic": fail_topic,
+              "outcome": "failure",
+              "what_worked": "",
+              "what_failed": "CI failed for topics: " + ", ".join(topics) + ((" - " + run_url) if run_url else ""),
+              "severity": "major",
+              "tags": ["ci", "auto-learn"],
+              "source": "gitlab_ci",
+          }
+          try:
+              post("learn", lesson)
+              print(f"🧠 CI failure recorded as Brain lesson: {fail_topic}")
+          except (urllib.error.URLError, urllib.error.HTTPError) as e:
+              print(f"⚠️  Brain learn API unreachable — failure lesson skipped (non-blocking): {e}")
+
+      payload = {
           "job_status": status,
           "topics": topics,
           "scan_topics": scan_topics,
           "source": "gitlab_ci",
-      }).encode()
-      req = urllib.request.Request(
-          f"{api}/api/v1/instances/{inst}/ci-outcome",
-          data=payload,
-          headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-          method="POST",
-      )
+      }
       try:
-          with urllib.request.urlopen(req, timeout=15) as r:
+          with post("ci-outcome", payload) as r:
               d = json.load(r)
       except (urllib.error.URLError, urllib.error.HTTPError) as e:
           print(f"⚠️  Brain CI outcome API unreachable — skipping (non-blocking): {e}")
@@ -141,6 +167,30 @@ variables:
       else:
           print("✅ Brain confirmed — no confidence changes needed.")
       PY
+
+# ── mode: hygiene ────────────────────────────────────────────────────────────
+# Periodic Brain sweep — dedup, decay stale lessons, flag conflicts. Run on a
+# schedule (Settings → CI/CD → Pipeline schedules), not per-pipeline.
+.cachly_hygiene:
+  image: node:20-slim
+  script:
+    - |
+      echo "🧹 Cachly Brain — running hygiene sweep..."
+      if npx --yes @cachly-dev/mcp-server@latest hygiene --instance-id "$CACHLY_INSTANCE_ID"; then
+        echo "✅ Brain hygiene sweep complete."
+      else
+        echo "⚠️  Brain hygiene CLI unavailable — falling back to API call."
+        # node:20 ships a global fetch, so the fallback needs no curl in the image.
+        node -e '
+          const api = (process.env.CACHLY_API_URL || "https://api.cachly.dev").replace(/\/+$/, "");
+          fetch(api + "/api/v1/mcp/call", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + process.env.CACHLY_API_KEY, "Content-Type": "application/json" },
+            body: JSON.stringify({ tool: "brain_hygiene", args: { instance_id: process.env.CACHLY_INSTANCE_ID } }),
+          }).then(r => r.text()).then(t => console.log(t)).catch(e => console.log("Hygiene skipped (offline): " + e.message));
+        '
+        echo "✅ Brain hygiene sweep complete."
+      fi
 
 # ── Examples (copy into your .gitlab-ci.yml, do not uncomment here) ───────────
 #
@@ -159,3 +209,8 @@ variables:
 #   when: always          # run even if earlier jobs failed, so failures are reported
 #   variables:
 #     CACHLY_CI_TOPICS: "auth:jwt,deploy:k8s"
+#
+# brain-hygiene:          # attach to a weekly pipeline schedule
+#   extends: .cachly_hygiene
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "schedule"'
